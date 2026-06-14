@@ -2,7 +2,6 @@ package theaudiodb
 
 import (
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -19,9 +18,6 @@ import (
 // theaudiodb:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone theaudiodb binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the theaudiodb driver. It carries no state; the per-run client is
@@ -39,162 +35,173 @@ func (Domain) Info() kit.DomainInfo {
 			Short:  "A command line for TheAudioDB music data.",
 			Long: `A command line for TheAudioDB music data.
 
-theaudiodb reads public theaudiodb data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+theaudiodb reads public TheAudioDB data over plain HTTPS, shapes it into
+clean records, and prints output that pipes into the rest of your tools. No paid
+API key needed.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/theaudiodb-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `theaudiodb page` and
-	// `ant get theaudiodb://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// artist: search for an artist by name
+	kit.Handle(app, kit.OpMeta{Name: "artist", Group: "read", Single: true,
+		Summary: "Search for an artist by name",
+		Args:    []kit.Arg{{Name: "name", Help: "artist name"}}}, searchArtist)
 
-	// List op: members of a page, the home of `theaudiodb links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// theaudiodb://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// album: search for an album by artist + album name
+	kit.Handle(app, kit.OpMeta{Name: "album", Group: "read", Single: true,
+		Summary: "Search for an album by artist and album name",
+		Args: []kit.Arg{
+			{Name: "artist", Help: "artist name"},
+			{Name: "album", Help: "album name"},
+		}}, searchAlbum)
 
-	// Search op: a free-text query, the home of `theaudiodb search` and the
-	// search box a host (ant) shows for this domain. A top-level op named "search"
-	// is exactly what kit.Host.Searchable looks for. Like links it emits page
-	// stubs, so a host can follow any hit to its own theaudiodb://page/ URI.
-	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read",
-		Summary: "Search theaudiodb",
-		Args:    []kit.Arg{{Name: "query", Help: "search query"}}}, searchPages)
+	// track: search for a track by artist + track name
+	kit.Handle(app, kit.OpMeta{Name: "track", Group: "read", Single: true,
+		Summary: "Search for a track by artist and track name",
+		Args: []kit.Arg{
+			{Name: "artist", Help: "artist name"},
+			{Name: "track", Help: "track name"},
+		}}, searchTrack)
+
+	// discography: list all albums by an artist
+	kit.Handle(app, kit.OpMeta{Name: "discography", Group: "read", List: true,
+		Summary: "List all albums by an artist",
+		Args:    []kit.Arg{{Name: "artist", Help: "artist name"}}}, discography)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	dcfg := DefaultConfig()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		dcfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		dcfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		dcfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		dcfg.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClientWithConfig(dcfg), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type artistIn struct {
+	Name   string  `kit:"arg" help:"artist name"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type albumIn struct {
+	Artist string  `kit:"arg" help:"artist name"`
+	Album  string  `kit:"arg" help:"album name"`
 	Client *Client `kit:"inject"`
 }
 
-type searchRef struct {
-	Query  string  `kit:"arg" help:"search query"`
+type trackIn struct {
+	Artist string  `kit:"arg" help:"artist name"`
+	Track  string  `kit:"arg" help:"track name"`
+	Client *Client `kit:"inject"`
+}
+
+type discographyIn struct {
+	Artist string  `kit:"arg" help:"artist name"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchArtist(ctx context.Context, in artistIn, emit func(*Artist) error) error {
+	artists, err := in.Client.SearchArtist(ctx, in.Name)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, a := range artists {
+		if err := emit(a); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func searchPages(ctx context.Context, in searchRef, emit func(*Page) error) error {
-	pages, err := in.Client.Search(ctx, in.Query, in.Limit)
+func searchAlbum(ctx context.Context, in albumIn, emit func(*Album) error) error {
+	albums, err := in.Client.SearchAlbum(ctx, in.Artist, in.Album)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, a := range albums {
+		if err := emit(a); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+func searchTrack(ctx context.Context, in trackIn, emit func(*Track) error) error {
+	tracks, err := in.Client.SearchTrack(ctx, in.Artist, in.Track)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, t := range tracks {
+		if err := emit(t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-// Classify turns any accepted input — a bare path or a full theaudiodb.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+func discography(ctx context.Context, in discographyIn, emit func(*Album) error) error {
+	albums, err := in.Client.Discography(ctx, in.Artist)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i, a := range albums {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
+		if err := emit(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver: URI driver string functions ---
+
+// Classify turns any accepted input into the canonical (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized theaudiodb reference: %q", input)
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty theaudiodb reference")
 	}
-	return "page", id, nil
+	return "artist", input, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "artist":
+		return "https://" + Host + "/artist/" + id, nil
+	case "album":
+		return "https://" + Host + "/album/" + id, nil
+	case "track":
+		return "https://" + Host + "/track/" + id, nil
+	default:
 		return "", errs.Usage("theaudiodb has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
 }
 
 // mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// exit code.
 func mapErr(err error) error {
 	return err
 }

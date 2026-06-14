@@ -1,63 +1,268 @@
 // Package theaudiodb is the library behind the theaudiodb command line:
-// the HTTP client, request shaping, and the typed data models for theaudiodb.
+// the HTTP client, request shaping, and the typed data models for TheAudioDB API.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
 package theaudiodb
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"regexp"
-	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to theaudiodb. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "theaudiodb/dev (+https://github.com/tamnd/theaudiodb-cli)"
+// Host is the site this client talks to.
+const Host = "www.theaudiodb.com"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at theaudiodb.com; change it once you
-// know the real endpoints you want to read.
-const Host = "theaudiodb.com"
-
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to theaudiodb over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds all tuneable client settings.
+type Config struct {
+	BaseURL   string
+	APIKey    string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+// DefaultConfig returns sensible defaults for the TheAudioDB free API.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://www.theaudiodb.com",
+		APIKey:    "2",
+		UserAgent: "theaudiodb-cli/0.1 (tamnd87@gmail.com)",
+		Rate:      500 * time.Millisecond,
+		Timeout:   15 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
+// Artist is a music artist record from TheAudioDB.
+type Artist struct {
+	ID         string `json:"id"          kit:"id"`
+	Name       string `json:"name"`
+	Genre      string `json:"genre"`
+	Country    string `json:"country"`
+	FormedYear string `json:"formed_year"`
+	Biography  string `json:"biography"`
+}
+
+// Album is a music album record from TheAudioDB.
+type Album struct {
+	ID     string `json:"id"     kit:"id"`
+	Name   string `json:"name"`
+	Artist string `json:"artist"`
+	Year   string `json:"year"`
+	Genre  string `json:"genre"`
+	Style  string `json:"style"`
+	Score  string `json:"score"`
+}
+
+// Track is a music track record from TheAudioDB.
+type Track struct {
+	ID          string `json:"id"           kit:"id"`
+	Name        string `json:"name"`
+	Artist      string `json:"artist"`
+	Album       string `json:"album"`
+	Duration    string `json:"duration"`
+	TrackNumber string `json:"track_number"`
+	Genre       string `json:"genre"`
+}
+
+// Client talks to TheAudioDB API over HTTP.
+type Client struct {
+	HTTP    *http.Client
+	cfg     Config
+	mu      sync.Mutex
+	lastReq time.Time
+}
+
+// NewClient returns a Client with DefaultConfig settings.
+func NewClient() *Client {
+	return NewClientWithConfig(DefaultConfig())
+}
+
+// NewClientWithConfig returns a Client configured with the given Config.
+func NewClientWithConfig(cfg Config) *Client {
+	return &Client{
+		HTTP: &http.Client{Timeout: cfg.Timeout},
+		cfg:  cfg,
+	}
+}
+
+// apiURL builds the full URL for a given endpoint and query params.
+func (c *Client) apiURL(endpoint string, params url.Values) string {
+	return fmt.Sprintf("%s/api/v1/json/%s/%s?%s", c.cfg.BaseURL, c.cfg.APIKey, endpoint, params.Encode())
+}
+
+// SearchArtist searches for artists by name.
+func (c *Client) SearchArtist(ctx context.Context, name string) ([]*Artist, error) {
+	params := url.Values{"s": {name}}
+	body, err := c.Get(ctx, c.apiURL("search.php", params))
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Artists []struct {
+			IDArtist       string `json:"idArtist"`
+			StrArtist      string `json:"strArtist"`
+			StrGenre       string `json:"strGenre"`
+			StrCountry     string `json:"strCountry"`
+			IntFormedYear  string `json:"intFormedYear"`
+			StrBiographyEN string `json:"strBiographyEN"`
+		} `json:"artists"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode artists: %w", err)
+	}
+	if resp.Artists == nil {
+		return nil, nil
+	}
+	out := make([]*Artist, len(resp.Artists))
+	for i, a := range resp.Artists {
+		bio := a.StrBiographyEN
+		if len(bio) > 200 {
+			bio = bio[:200]
+		}
+		out[i] = &Artist{
+			ID:         a.IDArtist,
+			Name:       a.StrArtist,
+			Genre:      a.StrGenre,
+			Country:    a.StrCountry,
+			FormedYear: a.IntFormedYear,
+			Biography:  bio,
+		}
+	}
+	return out, nil
+}
+
+// Discography returns all albums for a given artist name.
+func (c *Client) Discography(ctx context.Context, artistName string) ([]*Album, error) {
+	params := url.Values{"s": {artistName}}
+	body, err := c.Get(ctx, c.apiURL("discography.php", params))
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Album []struct {
+			IDAlbum         string `json:"idAlbum"`
+			StrAlbum        string `json:"strAlbum"`
+			StrArtist       string `json:"strArtist"`
+			IntYearReleased string `json:"intYearReleased"`
+			StrGenre        string `json:"strGenre"`
+			StrStyle        string `json:"strStyle"`
+			IntScore        string `json:"intScore"`
+		} `json:"album"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode discography: %w", err)
+	}
+	if resp.Album == nil {
+		return nil, nil
+	}
+	out := make([]*Album, len(resp.Album))
+	for i, a := range resp.Album {
+		out[i] = &Album{
+			ID:     a.IDAlbum,
+			Name:   a.StrAlbum,
+			Artist: a.StrArtist,
+			Year:   a.IntYearReleased,
+			Genre:  a.StrGenre,
+			Style:  a.StrStyle,
+			Score:  a.IntScore,
+		}
+	}
+	return out, nil
+}
+
+// SearchAlbum searches for albums by artist name and album name.
+func (c *Client) SearchAlbum(ctx context.Context, artistName, albumName string) ([]*Album, error) {
+	params := url.Values{"s": {artistName}, "a": {albumName}}
+	body, err := c.Get(ctx, c.apiURL("searchalbum.php", params))
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Album []struct {
+			IDAlbum         string `json:"idAlbum"`
+			StrAlbum        string `json:"strAlbum"`
+			StrArtist       string `json:"strArtist"`
+			IntYearReleased string `json:"intYearReleased"`
+			StrGenre        string `json:"strGenre"`
+			StrStyle        string `json:"strStyle"`
+			IntScore        string `json:"intScore"`
+		} `json:"album"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode album: %w", err)
+	}
+	if resp.Album == nil {
+		return nil, nil
+	}
+	out := make([]*Album, len(resp.Album))
+	for i, a := range resp.Album {
+		out[i] = &Album{
+			ID:     a.IDAlbum,
+			Name:   a.StrAlbum,
+			Artist: a.StrArtist,
+			Year:   a.IntYearReleased,
+			Genre:  a.StrGenre,
+			Style:  a.StrStyle,
+			Score:  a.IntScore,
+		}
+	}
+	return out, nil
+}
+
+// SearchTrack searches for tracks by artist name and track name.
+func (c *Client) SearchTrack(ctx context.Context, artistName, trackName string) ([]*Track, error) {
+	params := url.Values{"s": {artistName}, "t": {trackName}}
+	body, err := c.Get(ctx, c.apiURL("searchtrack.php", params))
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Track []struct {
+			IDTrack        string `json:"idTrack"`
+			StrTrack       string `json:"strTrack"`
+			StrArtist      string `json:"strArtist"`
+			StrAlbum       string `json:"strAlbum"`
+			IntDuration    string `json:"intDuration"`
+			IntTrackNumber string `json:"intTrackNumber"`
+			StrGenre       string `json:"strGenre"`
+		} `json:"track"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode track: %w", err)
+	}
+	if resp.Track == nil {
+		return nil, nil
+	}
+	out := make([]*Track, len(resp.Track))
+	for i, t := range resp.Track {
+		out[i] = &Track{
+			ID:          t.IDTrack,
+			Name:        t.StrTrack,
+			Artist:      t.StrArtist,
+			Album:       t.StrAlbum,
+			Duration:    t.IntDuration,
+			TrackNumber: t.IntTrackNumber,
+			Genre:       t.StrGenre,
+		}
+	}
+	return out, nil
+}
+
+// Get fetches rawURL and returns the response body. It paces and retries
+// according to the client's settings.
 func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -83,7 +288,7 @@ func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -107,13 +312,15 @@ func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool
 
 // pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.lastReq); wait > 0 {
 		time.Sleep(wait)
 	}
-	c.last = time.Now()
+	c.lastReq = time.Now()
 }
 
 func backoff(attempt int) time.Duration {
@@ -122,112 +329,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on theaudiodb.com. It is a stand-in for the typed records you
-// will model from the real theaudiodb endpoints.
-//
-// The kit struct tags make it addressable as a resource URI (see domain.go): ID
-// is the URI id, and Body is the long text `theaudiodb cat` and the Markdown
-// export print. The table tags shape the terminal grid (`-o table`) without
-// touching the JSON: URL is flagged the canonical column the `url` format prints,
-// and Body is hidden from the grid with `table:"-"` because a long preview wrecks
-// a row, though it still rides in `-o json` and `theaudiodb cat`. Swap `-` for
-// `table:"body,truncate"` if you would rather clip it to the terminal width.
-type Page struct {
-	ID    string `json:"id" kit:"id" table:"id"`
-	URL   string `json:"url" table:"url,url"`
-	Title string `json:"title,omitempty" table:"title"`
-	Body  string `json:"body,omitempty" kit:"body" table:"-"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-// Search fetches the site's search results for query and returns the matching
-// pages as stubs, the same shape PageLinks emits, so every hit is an addressable
-// theaudiodb.com page URI a host can follow. Like the rest of the scaffold it is a
-// stand-in: it reads the links out of a results page rather than a real search
-// API. Point it at the real endpoint and parse the real result shape once you
-// know it.
-func (c *Client) Search(ctx context.Context, query string, limit int) ([]*Page, error) {
-	body, err := c.Get(ctx, BaseURL+"/search?q="+url.QueryEscape(query))
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
